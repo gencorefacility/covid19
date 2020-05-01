@@ -21,7 +21,7 @@ TRIMMOMATIC = 'trimmomatic/0.36'
 SNPEFF = 'snpeff/4.3i'
 PYPAIRIX = 'pypairix/intel/0.2.3'
 HTSLIB = 'htslib/intel/1.4.1'
-DEEPTOOLS = 'deeptools/intel/2.4.2'
+DEEPTOOLS = 'deeptools/3.3.1'
 JVARKIT = 'jvarkit/base'
 PYSAM = 'pysam/intel/python3.6/0.14.1'
 PILON = 'pilon/1.23'
@@ -32,7 +32,11 @@ println "outdir: $params.out"
 
 ref = file(params.ref)
 snpeff_config = file(params.snpEff_config)
-primers = file(params.primers)
+//primers = file(params.primers)
+primers_a = file(params.primers_a)
+primers_b = file(params.primers_b)
+primers_c = file(params.primers_c)
+primers_d = file(params.primers_d)
 
 // Prepare the fastq read pairs for input.
 // Use the size parameter to not auto-group, and instead
@@ -49,7 +53,6 @@ process trim {
     publishDir "${params.out}/trimmed", mode:'copy'
 
     input:
-    file(primers)
     set pair_id,
         file(reads) from read_pairs_ch
 
@@ -60,6 +63,23 @@ process trim {
 	into trimmed_ch
 
     script:
+    // Set the A or B primer file according to the sample
+    primer_file = null
+    if(pair_id.endsWith("_A")){
+	primer_file = primers_a
+    }
+    else if(pair_id.endsWith("_B")){
+	primer_file = primers_b
+    }
+    else if(pair_id.endsWith("_C")){
+        primer_file = primers_c
+    }
+    else if(pair_id.endsWith("_D")){
+        primer_file = primers_d
+    }
+    else{
+	return "no matching primer file condition for ${pair_id}"
+    }
     """
     module load $TRIMMOMATIC
     java -jar \$TRIMMOMATIC_JAR \
@@ -73,7 +93,7 @@ process trim {
 	${pair_id}_trimmed_2.fq.gz \
 	${pair_id}.unpair_trimmed_2.fq.gz \
 	ILLUMINACLIP:${params.adapters}:2:30:10:8:true \
-        ILLUMINACLIP:${primers}:2:30:10:8:true \
+        ILLUMINACLIP:${primer_file}:2:30:10:8:true \
 	LEADING:20 TRAILING:20 SLIDINGWINDOW:4:20 MINLEN:20 
     """
 }
@@ -265,14 +285,20 @@ process haplotypeCaller {
     output:
     set val(sample_id), 
 	file("${sample_id}_raw_variants.vcf") into hc_output_ch
+    set val(hc_bamout_sample_id),
+	file("${sample_id}_haplotypecaller_bamout.bam"),
+	file("${sample_id}_haplotypecaller_bamout.bai") \
+	into hc_bam_bw_ch
 
     script:
+    hc_bamout_sample_id = sample_id + "-hc_bamout"
     """
     module load $GATK
     gatk HaplotypeCaller \
 	-R $ref \
 	-I $preprocessed_bam \
 	-O ${sample_id}_raw_variants.vcf \
+	-bamout ${sample_id}_haplotypecaller_bamout.bam \
 	-ploidy 1	
     """
 }
@@ -388,6 +414,7 @@ process consensus {
 	-R $ref \
 	-O ${sample_id}.fasta \
 	-V $filtered_snps
+    sed -i 's/1 SARS-CoV2:1-29903/${sample_id}/g' ${sample_id}.fasta
     """
 }
 
@@ -395,7 +422,6 @@ process snpEff{
     publishDir "${params.out}/snpEff", mode:'copy'
 
     input:
-    file(snpeff_config)
     set val(sample_id), 
 	file(snps) \
 	from snpeff_ch
@@ -422,10 +448,15 @@ process make_bw{
     set val(id), 
 	file(bam),
 	file(bam_index) \
-	from individual_bw_ch.mix(merged_bw_ch)
+	from individual_bw_ch
+	.mix(merged_bw_ch)
+	.mix(hc_bam_bw_ch)
 
     output:
     file("${id}_coverage.bam.bw") into jbrowse_bw_ch 
+
+    when:
+    id != "CV-40-hc_bamout"
 
     script:
     """
@@ -433,6 +464,9 @@ process make_bw{
     bamCoverage \
         -p max  \
         --bam $bam \
+	--binSize 1 \
+	--ignoreDuplicates \
+	--minMappingQuality 20 \
         -o ${id}_coverage.bam.bw
     """
 }
@@ -493,7 +527,7 @@ process jbrowse{
     file '*.json' into trackList_ch
 
     when:
-    false
+    true
 
     script:
     """
