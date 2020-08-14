@@ -25,6 +25,8 @@ DEEPTOOLS = 'deeptools/3.3.1'
 JVARKIT = 'jvarkit/base'
 PYSAM = 'pysam/intel/python3.6/0.14.1'
 PILON = 'pilon/1.23'
+BCFTOOLS = 'bcftools/intel/1.9'
+BEDTOOLS = 'bedtools/intel/2.27.1'
 
 println "reads: $params.reads"
 println "ref: $params.ref"
@@ -46,8 +48,12 @@ primers_d = file(params.primers_d)
 Channel
     .fromFilePairs( params.reads, size: -1)
     { file -> file.getBaseName() - ~/${params.read_pair_regex}/ - ~/.fastq/ }
-    .ifEmpty { error "Cannot find any reads matching: ${params.reads}"  }
     .set { read_pairs_ch }
+
+Channel
+    .fromFilePairs( params.bams, size: 1) 
+    { file -> file.getBaseName() - ~/.bam/ }
+    .set { bams_in_ch }
 
 process trim {
     publishDir "${params.out}/trimmed", mode:'copy'
@@ -64,21 +70,15 @@ process trim {
 
     script:
     // Set the A or B primer file according to the sample
-    primer_file = null
-    if(pair_id.endsWith("_A")){
-	primer_file = primers_a
+    trim_primer_cmd = null
+    if(pair_id.endsWith("-A") || pair_id.endsWith("_A")){
+	trim_primer_cmd = "ILLUMINACLIP:${primers_a}:2:30:10:8:true"
     }
-    else if(pair_id.endsWith("_B")){
-	primer_file = primers_b
-    }
-    else if(pair_id.endsWith("_C")){
-        primer_file = primers_c
-    }
-    else if(pair_id.endsWith("_D")){
-        primer_file = primers_d
+    else if(pair_id.endsWith("-B") || pair_id.endsWith("_B")){
+    	trim_primer_cmd = "ILLUMINACLIP:${primers_b}:2:30:10:8:true"
     }
     else{
-	return "no matching primer file condition for ${pair_id}"
+	trim_primer_cmd = ""
     }
     """
     module load $TRIMMOMATIC
@@ -93,8 +93,8 @@ process trim {
 	${pair_id}_trimmed_2.fq.gz \
 	${pair_id}.unpair_trimmed_2.fq.gz \
 	ILLUMINACLIP:${params.adapters}:2:30:10:8:true \
-        ILLUMINACLIP:${primer_file}:2:30:10:8:true \
-	LEADING:20 TRAILING:20 SLIDINGWINDOW:4:20 MINLEN:20 
+	${trim_primer_cmd} \
+	LEADING:20 TRAILING:20 SLIDINGWINDOW:4:20 MINLEN:20
     """
 }
 
@@ -107,17 +107,18 @@ process align {
 	file(read_2) from trimmed_ch
      
     output:
-    val(pair_id) into jbrowse_pair_id_ch
+    val(pair_id_unmerged) into jbrowse_pair_id_ch
     set val(sample_id), 
 	file("${pair_id}_aligned_reads.bam") \
 	into aligned_reads_ch
-    set val(pair_id),
+    set val(pair_id_unmerged),
         file("${pair_id}_aligned_reads.bam"),
 	file("${pair_id}_aligned_reads.bai") \
 	into individual_bw_ch
 	
     script:
     sample_id=pair_id - ~/${params.grouping_regex}/
+    pair_id_unmerged=pair_id + "_unmerged"
     readGroup = "@RG\\tID:${pair_id}\\tLB:${pair_id}\\tPL:${params.pl}\\tPM:${params.pm}\\tSM:${pair_id}"
     """
     module load $BWA
@@ -184,12 +185,13 @@ process markDuplicatesSpark  {
     input:
     set val(sample_id), 
 	file(bam) from merged_bam_ch
+	.mix(bams_in_ch)
 
     output:
     val(sample_id) into jbrowse_sample_id_ch
     set val(sample_id),
 	file("${sample_id}_sorted_dedup.bam") \
-	into sorted_dedup_bam_ch, sorted_dedup_ch_for_metrics, downsample_bam_ch, pilon_ch
+	into sorted_dedup_bam_ch, sorted_dedup_ch_for_metrics, downsample_bam_ch, pilon_ch, bcftools_ch, consensus_bam_ch
     set val(sample_id),
         file("${sample_id}_sorted_dedup.bam"),
         file("${sample_id}_sorted_dedup.bam.bai") \
@@ -274,6 +276,35 @@ process pilon{
 	-O ${sample_id}_pilon.vcf \
 	--exclude-non-variants \
 	--exclude-filtered
+    """
+}
+
+process bcftools{
+    publishDir "${params.out}/bcftools", mode:'copy'
+
+    input:
+    set val(sample_id),
+        file(preprocessed_bam) from bcftools_ch
+
+    output:
+    file("${sample_id}_bcftools.vcf") into bcftools_bzip_tabix_vcf_ch
+
+    script:
+    """
+    module load $BCFTOOLS
+    bcftools mpileup \
+	--redo-BAQ \
+	--adjust-MQ 50 \
+	--gap-frac 0.05 \
+	--max-depth 10000 \
+	--max-idepth 200000 \
+	--fasta-ref $ref \
+	$preprocessed_bam | bcftools call \
+	--ploidy 1 \
+	--keep-alts \
+	--multiallelic-caller \
+	--variants-only \
+	--output ${sample_id}_bcftools.vcf
     """
 }
 
@@ -362,7 +393,6 @@ process filterSnps {
         -filter-name "FS_filter" -filter "FS > 60.0" \
         -filter-name "MQ_filter" -filter "MQ < 40.0" \
         -filter-name "SOR_filter" -filter "SOR > 4.0" \
-        -filter-name "MQRankSum_filter" -filter "MQRankSum < -12.5" \
         -filter-name "ReadPosRankSum_filter" -filter "ReadPosRankSum < -8.0"
 
     # This script generates the _consensus_snps.vcf
@@ -388,6 +418,7 @@ process filterIndels {
         -R $ref \
         -V $raw_indels \
         -O ${sample_id}_filtered_indels.vcf \
+	-filter-name "DP_filter" -filter "DP < 20.0" \
 	-filter-name "QD_filter" -filter "QD < 2.0" \
 	-filter-name "FS_filter" -filter "FS > 200.0" \
 	-filter-name "SOR_filter" -filter "SOR > 10.0"
@@ -399,22 +430,57 @@ process consensus {
 
     input:
     set val(sample_id), 
-	file(filtered_snps) \
+	file(filtered_snps),
+	file(bam) \
 	from consensus_snps_ch
+	.join(consensus_bam_ch)
 
     output:
-    file("${sample_id}.fasta") into consensus_ch
+    file("${sample_id}*.fasta") into consensus_ch
 
     script:
     """
     module load $GATK
+    module load $BEDTOOLS
+    module load $SAMTOOLS
+
     gatk IndexFeatureFile \
 	-F $filtered_snps
     gatk FastaAlternateReferenceMaker \
 	-R $ref \
 	-O ${sample_id}.fasta \
 	-V $filtered_snps
-    sed -i 's/1 SARS-CoV2:1-29903/${sample_id}/g' ${sample_id}.fasta
+    
+    # chromosome ID needs to match ID in bam for bedtools (maskfasta)
+    sed -i 's/1 SARS-CoV2:1-29903/SARS-CoV2/g' ${sample_id}.fasta
+    for x in {6,10,20}
+    do
+	# make bedfile with regions below x coverage
+        # genomecov generates bedgraph file
+	# genomecov input is filtered for min MAPQ (20)
+	# and to remove dups and non-primary alignments
+	# first awk filters bedgraph for coverage <= x
+	# second awk converts bedgraph to 3-col bedfile
+	samtools view \
+		-bq 20 \
+		-F 1284 \
+		$bam | \
+		bedtools genomecov \
+		-ibam stdin \
+		-bga | \
+		awk -v threshold="\$x" '\$4<threshold' | \
+		awk '{print \$1 "\t" \$2 "\t" \$3}' \
+		> ${sample_id}_below_\${x}_cov.bed
+
+	# mask all regions in bedfile produced above
+	bedtools maskfasta \
+		-fi ${sample_id}.fasta \
+		-bed ${sample_id}_below_\${x}_cov.bed \
+		-fo ${sample_id}_below_\${x}_masked.fasta
+
+	# rename the fasta header from ref name to sample id
+	sed -i 's/SARS-CoV2/${sample_id}/g' ${sample_id}_below_\${x}_masked.fasta
+    done
     """
 }
 
@@ -456,7 +522,7 @@ process make_bw{
     file("${id}_coverage.bam.bw") into jbrowse_bw_ch 
 
     when:
-    id != "CV-40-hc_bamout"
+    id != "CV-40-hc_bamout" && id != "CV-70-hc_bamout" && id != "CV-62-hc_bamout"
 
     script:
     """
@@ -500,6 +566,7 @@ process bzip_tabix_vcf{
 	.mix(cons_bzip_tabix_vcf_ch)
 	.mix(indel_bzip_tabix_vcf_ch)
 	.mix(snpeff_bzip_tabix_vcf_ch)
+	.mix(bcftools_bzip_tabix_vcf_ch)
 
     output:
     file("*.vcf.gz*") into jbrowse_vcf_ch
@@ -517,7 +584,7 @@ process jbrowse{
     publishDir "${params.out}/trackList", mode:'copy'
 
     input:
-    val pair_ids from jbrowse_pair_id_ch.collect()
+    val pair_ids from jbrowse_pair_id_ch.collect().ifEmpty("")
     val sample_ids from jbrowse_sample_id_ch.collect()
     file '*' from jbrowse_bw_ch.collect()
     file '*' from jbrowse_bam_ch.collect()
